@@ -43,7 +43,7 @@ Voraussetzungen:
 3. Git-Submodule (VST3 SDK):
 
 ```bat
-git clone --recursive https://github.com/<user>/WNicheLooper
+git clone --recursive https://github.com/TheBigSchabowski/WNicheLooper
 :: oder nachträglich, nur die benötigten Submodule (spart vstgui/doc):
 git submodule update --init third_party/vst3sdk
 cd third_party\vst3sdk
