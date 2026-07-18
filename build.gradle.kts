@@ -68,6 +68,7 @@ val nativeSources = listOf(
     "native/AsioBackend.cpp",
     "native/WinAudioEngine.cpp",
     "native/VstPluginChain.cpp",
+    "native/vst_iids.cpp",
     "native/MediaDecode.cpp",
     "native/jni_bridge.cpp",
 )
