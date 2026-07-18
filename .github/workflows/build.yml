@@ -1,0 +1,43 @@
+name: Build Windows installer
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Only the VST3 SDK parts the host needs (skips vstgui4/doc/tutorials).
+      - name: Init VST3 SDK submodules
+        shell: bash
+        run: |
+          git submodule update --init third_party/vst3sdk
+          cd third_party/vst3sdk
+          git submodule update --init base pluginterfaces public.sdk
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      # jpackage needs the WiX 3.x tools (candle/light) on PATH for MSI.
+      - name: Install WiX Toolset
+        shell: pwsh
+        run: |
+          choco install wixtoolset --no-progress -y
+          Add-Content $env:GITHUB_PATH "C:\Program Files (x86)\WiX Toolset v3.14\bin"
+          Add-Content $env:GITHUB_PATH "C:\Program Files (x86)\WiX Toolset v3.11\bin"
+
+      - name: Build MSI (compiles nichelooper.dll via MSVC)
+        run: .\gradlew.bat --no-daemon packageMsi
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: NicheLooper-windows-installer
+          path: build/compose/binaries/main/msi/*.msi
+          if-no-files-found: error
