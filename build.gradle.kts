@@ -131,20 +131,24 @@ val buildNative = tasks.register("buildNative") {
         val objDir = layout.buildDirectory.dir("native-obj").get().asFile
         objDir.mkdirs()
 
+        // Everything on ONE line: cl response files have no reliable
+        // flag/argument split across lines. Paths with spaces are quoted;
+        // /I<path> is passed as a single token. Object files land in the
+        // process working directory (objDir), so no /Fo path is needed.
+        fun q(path: String) = if (path.contains(' ')) "\"$path\"" else path
         val args = mutableListOf(
             "/nologo", "/std:c++17", "/O2", "/EHsc", "/MD", "/W3", "/utf-8", "/LD",
             "/DNDEBUG", "/DRELEASE=1", "/DUNICODE", "/D_UNICODE", "/DNOMINMAX",
             "/D_CRT_SECURE_NO_WARNINGS",
-            "/I", file("native").absolutePath,
-            "/I", vst3Sdk.absolutePath,
-            "/I", file("third_party/asiosdk/common").absolutePath,
-            "/I", File(jniHome, "include").absolutePath,
-            "/I", File(jniHome, "include/win32").absolutePath,
-            "/Fo${objDir.absolutePath}\\",
-            "/Fe${outputFile.absolutePath}",
+            "/I${q(file("native").absolutePath)}",
+            "/I${q(vst3Sdk.absolutePath)}",
+            "/I${q(file("third_party/asiosdk/common").absolutePath)}",
+            "/I${q(File(jniHome, "include").absolutePath)}",
+            "/I${q(File(jniHome, "include/win32").absolutePath)}",
+            "/Fe${q(outputFile.absolutePath)}",
         )
-        args += nativeSources.map { file(it).absolutePath }
-        args += vst3SdkSources.map { File(vst3Sdk, it).absolutePath }
+        args += nativeSources.map { q(file(it).absolutePath) }
+        args += vst3SdkSources.map { q(File(vst3Sdk, it).absolutePath) }
         args += listOf(
             "/link", "user32.lib", "gdi32.lib", "ole32.lib", "oleaut32.lib",
             "advapi32.lib", "shell32.lib", "uuid.lib", "winmm.lib",
@@ -152,9 +156,7 @@ val buildNative = tasks.register("buildNative") {
         )
 
         val rspFile = File(objDir, "cl_args.rsp")
-        rspFile.writeText(args.joinToString("\n") { arg ->
-            if (arg.contains(' ') && !arg.startsWith('"')) "\"$arg\"" else arg
-        })
+        rspFile.writeText(args.joinToString(" "))
         val batFile = File(objDir, "build_native.bat")
         batFile.writeText(
             "@echo off\r\n" +
@@ -163,7 +165,7 @@ val buildNative = tasks.register("buildNative") {
         )
 
         val process = ProcessBuilder("cmd", "/c", batFile.absolutePath)
-            .directory(projectDir)
+            .directory(objDir)
             .redirectErrorStream(true)
             .start()
         val output = process.inputStream.bufferedReader().readText()
