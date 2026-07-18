@@ -72,6 +72,11 @@ public:
     int32_t inputChannels() const { return mNumInputs; }
     int32_t outputChannels() const { return mNumOutputs; }
 
+    // Driver audio thread only — public because the ASIO callback
+    // trampolines (free functions, no user pointer) must reach them.
+    void onBufferSwitch(long bufferIndex);
+    void requestReset();
+
 private:
     struct Impl;
     friend struct Impl;
@@ -82,10 +87,6 @@ private:
 
     bool startOnControlThread(int32_t driverIndex, int32_t preferredSampleRate);
     void stopOnControlThread();
-
-    // Driver audio thread.
-    void onBufferSwitch(long bufferIndex);
-    void requestReset();
 
     Impl* mImpl = nullptr;  // driver handles + buffer infos (Windows types)
     AsioClient* mClient = nullptr;
