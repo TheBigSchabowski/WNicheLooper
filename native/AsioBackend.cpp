@@ -388,15 +388,34 @@ bool AsioBackend::startOnControlThread(int32_t driverIndex, int32_t preferredSam
     mNumInputs = std::min<int32_t>(static_cast<int32_t>(numInputs), kMaxChannels);
     mNumOutputs = std::min<int32_t>(static_cast<int32_t>(numOutputs), kMaxChannels);
 
-    ASIOSampleRate rate = 0;
+    ASIOSampleRate currentRate = 0;
+    const bool haveCurrentRate =
+        driver->getSampleRate(&currentRate) == ASE_OK && currentRate > 0;
+
+    // Only poke the driver if it isn't already running at the preferred rate; a
+    // rejected change (e.g. Windows shared mode holding the device at 44.1 kHz)
+    // is not fatal, we fall back to whatever rate the driver reports.
     if (preferredSampleRate > 0 &&
+        (!haveCurrentRate || static_cast<int32_t>(currentRate) != preferredSampleRate) &&
         driver->canSampleRate(static_cast<ASIOSampleRate>(preferredSampleRate)) == ASE_OK) {
-        driver->setSampleRate(static_cast<ASIOSampleRate>(preferredSampleRate));
+        const ASIOError setErr =
+            driver->setSampleRate(static_cast<ASIOSampleRate>(preferredSampleRate));
+        if (setErr != ASE_OK) {
+            std::fprintf(stderr,
+                         "NicheLooper: ASIO setSampleRate(%d) rejected (err %ld), "
+                         "falling back to current rate\n",
+                         preferredSampleRate, setErr);
+        }
     }
+
+    ASIOSampleRate rate = 0;
     if (driver->getSampleRate(&rate) != ASE_OK || rate <= 0) {
-        std::fprintf(stderr, "NicheLooper: ASIO getSampleRate failed\n");
-        stopOnControlThread();
-        return false;
+        if (!haveCurrentRate) {
+            std::fprintf(stderr, "NicheLooper: ASIO getSampleRate failed\n");
+            stopOnControlThread();
+            return false;
+        }
+        rate = currentRate;
     }
     mSampleRate = static_cast<int32_t>(rate);
 
