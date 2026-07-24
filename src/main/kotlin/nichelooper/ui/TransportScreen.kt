@@ -572,12 +572,42 @@ private fun ChainsCard(
 
             OutlinedButton(
                 onClick = {
+                    // System-L&F für nativen Look des JFileChooser
+                    // (Compose-Rendering wird nicht beeinflusst).
+                    try {
+                        javax.swing.UIManager.setLookAndFeel(
+                            javax.swing.UIManager.getSystemLookAndFeelClassName()
+                        )
+                    } catch (e: Exception) { /* aktuelle L&F behalten */ }
+
                     val chooser = javax.swing.JFileChooser().apply {
                         dialogTitle = "VST3 auswählen (.vst3-Bundle oder -Datei)"
                         fileSelectionMode = javax.swing.JFileChooser.FILES_AND_DIRECTORIES
+
+                        // .vst3-Plugins sind auf macOS/Windows Bundles
+                        // (Verzeichnisse mit .vst3-Endung). Ohne diese
+                        // FileView behandelt JFileChooser sie als navigierbare
+                        // Ordner — man kann sie nicht als Datei auswählen.
+                        // isTraversable = false macht sie selektierbar.
+                        fileView = object : javax.swing.filechooser.FileView() {
+                            override fun isTraversable(f: java.io.File): Boolean? =
+                                if (f.name.endsWith(".vst3", ignoreCase = true)) false else null
+                        }
+
                         fileFilter = javax.swing.filechooser.FileNameExtensionFilter(
                             "VST3 plugin (.vst3)", "vst3",
                         )
+
+                        // Standard-VST3-Verzeichnis als Startpunkt.
+                        val os = System.getProperty("os.name").lowercase()
+                        val vst3Dir = when {
+                            os.contains("win") ->
+                                java.io.File("C:\\Program Files\\Common Files\\VST3")
+                            os.contains("mac") ->
+                                java.io.File("/Library/Audio/Plug-Ins/VST3")
+                            else -> java.io.File(System.getProperty("user.home"), ".vst3")
+                        }
+                        if (vst3Dir.isDirectory) currentDirectory = vst3Dir
                     }
                     if (chooser.showOpenDialog(null) == javax.swing.JFileChooser.APPROVE_OPTION) {
                         chooser.selectedFile?.absolutePath?.let(onAddPluginFromFile)
