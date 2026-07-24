@@ -190,7 +190,7 @@ compose.desktop {
             // MSI needs the WiX toolset (https://wixtoolset.org) on PATH.
             targetFormats(TargetFormat.Msi)
             packageName = "NicheLooper"
-            packageVersion = "1.0.0"
+            packageVersion = "1.0.1"
             windows {
                 menuGroup = "NicheLooper"
                 upgradeUuid = "6f9b1c3a-8f27-4e0a-9c3d-2b7a4e5d6c81"
