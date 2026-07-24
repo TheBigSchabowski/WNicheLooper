@@ -860,6 +860,37 @@ std::unique_ptr<VstPlugin> buildPlugin(const std::string& path, const VST3::UID&
     return nullptr;
 }
 
+// Loads the module at [path] (a .vst3 the user picked from disk) and builds its
+// first non-instrument audio-effect class. Mirrors the class selection used by
+// scanInstalledPlugins so a hand-picked plugin behaves like an auto-scanned one.
+std::unique_ptr<VstPlugin> buildFirstEffectFromPath(const std::string& path) {
+    std::string error;
+    auto module = Hosting::Module::create(path, error);
+    if (module == nullptr) {
+        std::fprintf(stderr, "NicheLooper: add-from-path load failed (%s): %s\n",
+                     path.c_str(), error.c_str());
+        return nullptr;
+    }
+    for (const auto& classInfo : module->getFactory().classInfos()) {
+        if (classInfo.category() != kVstAudioEffectClass) {
+            continue;
+        }
+        if (classInfo.subCategoriesString().find("Instrument") != std::string::npos) {
+            continue;
+        }
+        const std::string display = classInfo.vendor().empty()
+                                        ? classInfo.name()
+                                        : classInfo.vendor() + ": " + classInfo.name();
+        auto plugin = std::make_unique<VstPlugin>(module, classInfo, display);
+        if (!plugin->instantiate()) {
+            return nullptr;
+        }
+        return plugin;
+    }
+    std::fprintf(stderr, "NicheLooper: no audio-effect class in %s\n", path.c_str());
+    return nullptr;
+}
+
 // ---- Bank serialization helpers -------------------------------------------
 
 constexpr uint32_t kBankMagic = 0x314B574Eu;  // "NWK1" little-endian
@@ -965,6 +996,30 @@ bool PluginChainManager::addPlugin(int chain, int pluginIndex) {
     // Instantiate + initialize OUTSIDE the lock (can take hundreds of ms for
     // big plugins) so the audio thread keeps processing meanwhile.
     auto plugin = buildPlugin(spec.path, spec.uid, spec.displayName);
+    if (plugin == nullptr || !plugin->prepare(sampleRate, maxFrames)) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> guard(mImpl->lock);
+    mImpl->chains[chain].push_back(std::move(plugin));
+    return true;
+}
+
+bool PluginChainManager::addPluginFromPath(int chain, const std::string& path) {
+    if (chain < 0 || chain >= kNumChains) {
+        return false;
+    }
+    int sampleRate;
+    int maxFrames;
+    {
+        std::lock_guard<std::mutex> guard(mImpl->lock);
+        sampleRate = mImpl->sampleRate;
+        maxFrames = mImpl->maxFrames;
+    }
+
+    // Load + instantiate OUTSIDE the lock (can take hundreds of ms) so the audio
+    // thread keeps processing meanwhile — identical to addPlugin().
+    auto plugin = buildFirstEffectFromPath(path);
     if (plugin == nullptr || !plugin->prepare(sampleRate, maxFrames)) {
         return false;
     }

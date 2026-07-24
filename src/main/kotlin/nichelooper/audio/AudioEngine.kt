@@ -154,6 +154,10 @@ object AudioEngine {
     fun chainAddPlugin(chain: Int, pluginIndex: Int): Boolean =
         nativeChainAddPlugin(chain, pluginIndex)
 
+    /** Adds a VST3 the user picked from disk ([path] = a .vst3 bundle/file). */
+    fun chainAddPluginFromPath(chain: Int, path: String): Boolean =
+        nativeChainAddPluginFromPath(chain, path)
+
     fun chainRemovePlugin(chain: Int, slot: Int): Boolean =
         nativeChainRemovePlugin(chain, slot)
 
@@ -224,6 +228,7 @@ object AudioEngine {
     )
     private external fun nativeGetEffectPluginNames(): Array<String>
     private external fun nativeChainAddPlugin(chain: Int, pluginIndex: Int): Boolean
+    private external fun nativeChainAddPluginFromPath(chain: Int, path: String): Boolean
     private external fun nativeChainRemovePlugin(chain: Int, slot: Int): Boolean
     private external fun nativeChainMovePlugin(chain: Int, from: Int, to: Int): Boolean
     private external fun nativeChainGetPluginNames(chain: Int): Array<String>

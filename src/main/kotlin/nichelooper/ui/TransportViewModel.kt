@@ -349,6 +349,21 @@ class TransportViewModel {
         }
     }
 
+    /** Adds a plugin the user picked from disk (a .vst3 bundle/file) to the active chain. */
+    fun addPluginFromFile(path: String) {
+        val chain = _uiState.value.activeChain
+        scope.launch {
+            val ok = AudioEngine.chainAddPluginFromPath(chain, path)
+            val name = path.substringAfterLast(java.io.File.separatorChar)
+            _uiState.update {
+                it.copy(
+                    chains = readChains(),
+                    saveMessage = if (ok) null else "Plugin failed to load: $name",
+                )
+            }
+        }
+    }
+
     fun removePluginFromChain(slot: Int) {
         val chain = _uiState.value.activeChain
         scope.launch {

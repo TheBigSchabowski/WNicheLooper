@@ -285,6 +285,18 @@ Java_nichelooper_audio_AudioEngine_nativeChainAddPlugin(
 }
 
 JNIEXPORT jboolean JNICALL
+Java_nichelooper_audio_AudioEngine_nativeChainAddPluginFromPath(
+        JNIEnv* env, jobject /*thiz*/, jint chain, jstring path) {
+    const char* utf8 = env->GetStringUTFChars(path, nullptr);
+    if (utf8 == nullptr) {
+        return JNI_FALSE;
+    }
+    std::string nativePath(utf8);
+    env->ReleaseStringUTFChars(path, utf8);
+    return gEngine.plugins().addPluginFromPath(chain, nativePath) ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL
 Java_nichelooper_audio_AudioEngine_nativeChainRemovePlugin(
         JNIEnv* /*env*/, jobject /*thiz*/, jint chain, jint slot) {
     return gEngine.plugins().removePlugin(chain, slot) ? JNI_TRUE : JNI_FALSE;

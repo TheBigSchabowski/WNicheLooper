@@ -122,6 +122,7 @@ fun TransportScreen(viewModel: TransportViewModel) {
             state = state,
             onSelectChain = viewModel::setActiveChain,
             onAddPlugin = viewModel::addPluginToChain,
+            onAddPluginFromFile = viewModel::addPluginFromFile,
             onRemovePlugin = viewModel::removePluginFromChain,
             onMovePluginUp = viewModel::movePluginUp,
             onOpenEditor = viewModel::openPluginEditor,
@@ -464,6 +465,7 @@ private fun ChainsCard(
     state: TransportUiState,
     onSelectChain: (Int) -> Unit,
     onAddPlugin: (Int) -> Unit,
+    onAddPluginFromFile: (String) -> Unit,
     onRemovePlugin: (Int) -> Unit,
     onMovePluginUp: (Int) -> Unit,
     onOpenEditor: (Int) -> Unit,
@@ -567,6 +569,22 @@ private fun ChainsCard(
                     }
                 }
             }
+
+            OutlinedButton(
+                onClick = {
+                    val chooser = javax.swing.JFileChooser().apply {
+                        dialogTitle = "VST3 auswählen (.vst3-Bundle oder -Datei)"
+                        fileSelectionMode = javax.swing.JFileChooser.FILES_AND_DIRECTORIES
+                        fileFilter = javax.swing.filechooser.FileNameExtensionFilter(
+                            "VST3 plugin (.vst3)", "vst3",
+                        )
+                    }
+                    if (chooser.showOpenDialog(null) == javax.swing.JFileChooser.APPROVE_OPTION) {
+                        chooser.selectedFile?.absolutePath?.let(onAddPluginFromFile)
+                    }
+                },
+                modifier = Modifier.fillMaxWidth(),
+            ) { Text("+ ADD FROM FILE…") }
         }
     }
 }

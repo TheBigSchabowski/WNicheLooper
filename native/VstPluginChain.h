@@ -48,6 +48,13 @@ public:
     // could not be created or initialized (e.g. unsupported layout).
     bool addPlugin(int chain, int pluginIndex);
 
+    // Loads the VST3 module the user picked from disk ([path] is a .vst3 bundle
+    // or file) at the current engine rate and appends its first non-instrument
+    // audio-effect class to the chain. Returns false if the module cannot be
+    // loaded or exposes no usable effect. Like addPlugin(), the slow load +
+    // instantiate happens off the audio lock.
+    bool addPluginFromPath(int chain, const std::string& path);
+
     bool removePlugin(int chain, int slot);
     bool movePlugin(int chain, int from, int to);
     std::vector<std::string> chainPluginNames(int chain);
