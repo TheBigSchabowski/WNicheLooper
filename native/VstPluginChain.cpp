@@ -228,13 +228,29 @@ void registerEditorClassOnce() {
 }
 
 
-// Reliably raises [hwnd] to the foreground even though the caller is a
-// background thread (PluginUiThread). Plain SetForegroundWindow() is
-// restricted to the foreground thread on Windows; from any other thread it
-// silently fails and the editor ends up behind the host window — the
-// "öffnet im Hintergrund" symptom. We attach our input queue to the
-// foreground thread's (documented foreground-steal), flash topmost-then-
-// notopmost, and activate/focus the window.
+// Raises [hwnd] to the top of the Z-order from the PluginUiThread — a non-
+// foreground background thread — WITHOUT the AttachThreadInput/SetForegroundWindow
+// dance that commit 7fffce4 introduced.
+//
+// That dance is a documented Win32 deadlock: attaching our input queue to a
+// busy foreground GUI thread and then calling SetForegroundWindow hangs the
+// caller (Raymond Chen, "The dangers of attaching input queues"; the failure is
+// specifically called out for plugin editors). Our foreground thread is the
+// JVM/Compose window thread; while it renders a frame it does not pump messages
+// promptly, so the PluginUiThread froze *inside* bringToForeground. Two
+// symptoms followed: (1) no later editor job could run — the frozen job blocks
+// the UI thread's FIFO, so e.g. NAM's window never opened; (2) a plugin holding
+// an internal GUI/DSP lock across attached() stalled its own process() on the
+// audio thread against that same lock → the audio callback stalled → the sound
+// dropped out ("Ton weg beim Edit").
+//
+// A plain HWND_TOPMOST→HWND_NOTOPMOST flash raises the window to the front from
+// any thread and never attaches input queues, so it cannot hang. When the user
+// clicks "edit" our process already owns the foreground window, so a bare
+// SetForegroundWindow is permitted process-wide with no thread attach; if
+// Windows still declines it the flash has already put the window on top. The
+// editor HWND belongs to this (PluginUiThread) thread, so SetActiveWindow /
+// SetFocus act on our own window and likewise cannot block on a foreign thread.
 void bringToForeground(HWND hwnd) {
     if (hwnd == nullptr) {
         return;
@@ -242,25 +258,14 @@ void bringToForeground(HWND hwnd) {
     if (IsIconic(hwnd)) {
         ShowWindow(hwnd, SW_RESTORE);
     } else {
-        ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        ShowWindow(hwnd, SW_SHOW);
     }
-    HWND foreground = GetForegroundWindow();
-    DWORD foregroundThread =
-        (foreground != nullptr) ? GetWindowThreadProcessId(foreground, nullptr) : 0;
-    const DWORD myThread = GetCurrentThreadId();
-    const bool attached = foregroundThread != 0 && foregroundThread != myThread &&
-                          AttachThreadInput(myThread, foregroundThread, TRUE) != 0;
-    SetForegroundWindow(hwnd);
-    SetActiveWindow(hwnd);
-    if (attached) {
-        AttachThreadInput(myThread, foregroundThread, FALSE);
-    }
-    // Topmost-flash forces the window above everything for one frame, then we
-    // drop the topmost flag so subsequent clicks behave normally.
     SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    SetForegroundWindow(hwnd);  // best-effort; own-process foreground, no attach
+    SetActiveWindow(hwnd);
     SetFocus(hwnd);
     RedrawWindow(hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ALLCHILDREN);
 }
