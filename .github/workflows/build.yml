@@ -8,6 +8,9 @@ on:
 jobs:
   build:
     runs-on: windows-latest
+    # Needed to create the GitHub release + upload the MSI to it.
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -41,3 +44,32 @@ jobs:
           name: NicheLooper-windows-installer
           path: build/compose/binaries/main/msi/*.msi
           if-no-files-found: error
+
+      # The MSI version is the single source of truth for the release tag.
+      - name: Read packageVersion
+        id: ver
+        shell: bash
+        run: |
+          v=$(grep -oE 'packageVersion *= *"[0-9]+\.[0-9]+\.[0-9]+"' build.gradle.kts \
+              | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+          if [ -z "$v" ]; then echo "packageVersion not found in build.gradle.kts" >&2; exit 1; fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "Release tag will be v$v"
+
+      # Re-runnable: a re-built MSI replaces the asset on an existing release
+      # instead of failing on the duplicate tag.
+      - name: Publish release
+        if: github.ref == 'refs/heads/main'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="v${{ steps.ver.outputs.version }}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag exists — replacing the installer asset."
+            gh release upload "$tag" build/compose/binaries/main/msi/*.msi --clobber
+          else
+            gh release create "$tag" build/compose/binaries/main/msi/*.msi \
+              --title "NicheLooper $tag" \
+              --generate-notes
+          fi
