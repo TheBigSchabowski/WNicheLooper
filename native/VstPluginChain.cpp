@@ -2,6 +2,8 @@
 
 #include <windows.h>
 
+#include <ole2.h>
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -120,6 +122,15 @@ private:
     void threadMain() {
         mThreadId = GetCurrentThreadId();
 
+        // Make this a COM Single-Threaded Apartment BEFORE any plugin editor is
+        // created here. Real hosts (e.g. FL Studio) run plugin editors on an
+        // STA-initialised UI thread; many VST3 editors use OLE/COM (Direct2D/3D,
+        // WebView, drag & drop, file dialogs) and misbehave — typically the
+        // first view works but a second create/open fails — on a thread that was
+        // never OleInitialize()'d. HRESULT is intentionally ignored: S_FALSE just
+        // means already initialised on this thread.
+        OleInitialize(nullptr);
+
         WNDCLASSW messageClass{};
         messageClass.lpfnWndProc = &PluginUiThread::messageProc;
         messageClass.hInstance = GetModuleHandleW(nullptr);
@@ -134,6 +145,7 @@ private:
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
+        OleUninitialize();
     }
 
     HANDLE mReady = nullptr;
@@ -594,7 +606,14 @@ public:
             return;
         }
         PluginUiThread::instance().run(false, [this] {
+            // Logged on every "edit" click: if this line is absent on the 2nd
+            // attempt, the UI thread wedged and the job never ran (FIFO stall);
+            // if it prints "refocus" but nothing appears, the refocus path is at
+            // fault; if it reaches createView, the problem is view creation.
+            std::fprintf(stderr, "NicheLooper: openEditor job for %s (existing=%d)\n",
+                         mName.c_str(), (mEditor != nullptr && mEditor->hwnd != nullptr) ? 1 : 0);
             if (mEditor != nullptr && mEditor->hwnd != nullptr) {
+                std::fprintf(stderr, "NicheLooper: %s refocus existing editor\n", mName.c_str());
                 bringToForeground(mEditor->hwnd);
                 return;
             }
