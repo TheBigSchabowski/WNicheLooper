@@ -227,6 +227,44 @@ void registerEditorClassOnce() {
     registered = true;
 }
 
+
+// Reliably raises [hwnd] to the foreground even though the caller is a
+// background thread (PluginUiThread). Plain SetForegroundWindow() is
+// restricted to the foreground thread on Windows; from any other thread it
+// silently fails and the editor ends up behind the host window — the
+// "öffnet im Hintergrund" symptom. We attach our input queue to the
+// foreground thread's (documented foreground-steal), flash topmost-then-
+// notopmost, and activate/focus the window.
+void bringToForeground(HWND hwnd) {
+    if (hwnd == nullptr) {
+        return;
+    }
+    if (IsIconic(hwnd)) {
+        ShowWindow(hwnd, SW_RESTORE);
+    } else {
+        ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    }
+    HWND foreground = GetForegroundWindow();
+    DWORD foregroundThread =
+        (foreground != nullptr) ? GetWindowThreadProcessId(foreground, nullptr) : 0;
+    const DWORD myThread = GetCurrentThreadId();
+    const bool attached = foregroundThread != 0 && foregroundThread != myThread &&
+                          AttachThreadInput(myThread, foregroundThread, TRUE) != 0;
+    SetForegroundWindow(hwnd);
+    SetActiveWindow(hwnd);
+    if (attached) {
+        AttachThreadInput(myThread, foregroundThread, FALSE);
+    }
+    // Topmost-flash forces the window above everything for one frame, then we
+    // drop the topmost flag so subsequent clicks behave normally.
+    SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    SetFocus(hwnd);
+    RedrawWindow(hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ALLCHILDREN);
+}
+
 std::wstring toWide(const std::string& utf8) {
     if (utf8.empty()) {
         return std::wstring();
@@ -552,19 +590,25 @@ public:
         }
         PluginUiThread::instance().run(false, [this] {
             if (mEditor != nullptr && mEditor->hwnd != nullptr) {
-                ShowWindow(mEditor->hwnd, SW_SHOW);
-                SetForegroundWindow(mEditor->hwnd);
+                bringToForeground(mEditor->hwnd);
                 return;
             }
             IPlugView* view = mController->createView(Vst::ViewType::kEditor);
             if (view == nullptr) {
-                std::fprintf(stderr, "NicheLooper: %s has no editor view\n", mName.c_str());
+                std::fprintf(stderr,
+                    "NicheLooper: %s createView(kEditor) returned null - no GUI\n",
+                    mName.c_str());
                 return;
             }
 
             registerEditorClassOnce();
             ViewRect size{};
-            if (view->getSize(&size) != kResultOk || size.getWidth() < 50 ||
+            const tresult getSizeResult = view->getSize(&size);
+            std::fprintf(stderr,
+                "NicheLooper: %s getSize=%d %dx%d canResize=%d\n",
+                mName.c_str(), static_cast<int>(getSizeResult), size.getWidth(),
+                size.getHeight(), view->canResize() == kResultTrue ? 1 : 0);
+            if (getSizeResult != kResultOk || size.getWidth() < 50 ||
                 size.getHeight() < 50) {
                 size = ViewRect(0, 0, 900, 600);
             }
@@ -592,9 +636,12 @@ public:
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(editor));
 
             view->setFrame(editor->frame);
-            if (view->attached(hwnd, Steinberg::kPlatformTypeHWND) != kResultOk) {
-                std::fprintf(stderr, "NicheLooper: attach editor failed for %s\n",
-                             mName.c_str());
+            const tresult attachResult =
+                view->attached(hwnd, Steinberg::kPlatformTypeHWND);
+            if (attachResult != kResultOk) {
+                std::fprintf(stderr,
+                    "NicheLooper: %s attached(kPlatformTypeHWND) FAILED (=%d)\n",
+                    mName.c_str(), static_cast<int>(attachResult));
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
                 DestroyWindow(hwnd);
                 view->setFrame(nullptr);
@@ -604,9 +651,10 @@ public:
                 return;
             }
             mEditor = editor;
-            ShowWindow(hwnd, SW_SHOW);
-            SetForegroundWindow(hwnd);
-            std::fprintf(stderr, "NicheLooper: editor window open for %s\n", mName.c_str());
+            bringToForeground(hwnd);
+            std::fprintf(stderr,
+                "NicheLooper: editor window open for %s (%dx%d, resizable=%d)\n",
+                mName.c_str(), size.getWidth(), size.getHeight(), resizable ? 1 : 0);
         });
     }
 
