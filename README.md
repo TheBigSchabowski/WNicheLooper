@@ -67,6 +67,19 @@ gradlew.bat packageMsi   :: Installer (braucht WiX Toolset auf dem PATH)
 2. **START ENGINE** drücken.
 3. REC / SET LOOP / OVERDUB wie gewohnt; Metronom, Drums, Count-in,
    Auto-Loop und alle Regler identisch zur macOS-Version.
+   Taktart (4/4, 3/4, 2/4, 6/8) setzt Taktlänge und Klick-Akzente, das
+   **Groove**-Menü darunter das Drum-Pattern innerhalb des Takts. Die
+   Groove-Liste zeigt nur Patterns der gewählten Taktart; ein Taktart-Wechsel
+   springt automatisch auf deren ersten Groove. Beide Tabellen stehen in
+   `native/RhythmSection.cpp` — ein neuer Groove ist ein Eintrag in
+   `kGrooves`, die UI liest Namen und Zuordnung über JNI aus.
+   - **Count-in** ist immer genau 2 volle Takte und startet das Drum-Pattern
+     beim REC-Druck neu auf Zählzeit 1. Ohne Count-in bleibt es beim alten
+     Verhalten: REC klinkt sich auf die nächste Taktlinie ein, ohne das
+     Raster zu verschieben.
+   - **Mute (`M`)** schaltet nur die Drums stumm, die Takt-Clock läuft
+     weiter — der Wiedereinstieg landet also immer im Groove. Bereits
+     angeschlagene Schläge klingen aus; das Metronom bleibt hörbar.
 4. **Achtung Feedback:** Bei Mikrofon + Lautsprechern (WASAPI) den
    „Monitor input“-Schalter ausschalten.
 5. **Amp-Sound hörbar machen:** Hardware-Direct-Monitoring am Interface
@@ -81,7 +94,8 @@ Gitarre → aktive Chain → Loop-Aufnahme + Monitor.
 - Gehostet werden die **VST3**-Builds der installierten Plugins aus den
   Standard-Ordnern (`C:\Program Files\Common Files\VST3` u. a.).
 - **Tasten `A` / `S` / `D`** (oder die Chips) schalten die Live-Chain
-  knackfrei um.
+  knackfrei um. **`M`** (oder der Mute-Chip) blendet die Drums live aus.
+  Die Tasten greifen nur, wenn kein Textfeld den Fokus hat.
 - „+ ADD PLUGIN“ fügt der aktiven Chain ein Plugin hinzu; **EDIT** öffnet
   das Original-Plugin-Fenster — dort z. B. das .nam-Modell laden.
 - **Presets** (oben rechts) speichern alle 3 Chains inkl. komplettem
