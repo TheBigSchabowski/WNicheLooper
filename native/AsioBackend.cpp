@@ -19,46 +19,180 @@ struct DriverEntry {
     std::string clsid;
 };
 
-// HKLM\SOFTWARE\ASIO\<subkey>: CLSID (+ optional Description). Order is the
-// registry enumeration order; driver indices refer to this list.
-std::vector<DriverEntry> enumerateDrivers() {
-    std::vector<DriverEntry> drivers;
+// PE machine type this process can load in-proc. An ASIO driver is a COM
+// in-proc server, so a driver DLL of the other bitness can never be
+// CoCreateInstance'd from here — listing it would only offer the user a
+// device that always fails to open.
+#if defined(_M_ARM64)
+constexpr uint16_t kHostMachine = 0xAA64;  // IMAGE_FILE_MACHINE_ARM64
+#elif defined(_M_AMD64)
+constexpr uint16_t kHostMachine = 0x8664;  // IMAGE_FILE_MACHINE_AMD64
+#else
+constexpr uint16_t kHostMachine = 0x014C;  // IMAGE_FILE_MACHINE_I386
+#endif
+
+// Reads a REG_SZ/REG_EXPAND_SZ value ("" = the key's default value) from the
+// given registry view. Empty when absent or of another type.
+std::string readStringValue(const std::string& subKey, const char* valueName, REGSAM view) {
+    HKEY key = nullptr;
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, subKey.c_str(), 0, KEY_READ | view, &key) !=
+        ERROR_SUCCESS) {
+        return std::string();
+    }
+    char buffer[1024] = {0};
+    DWORD size = sizeof(buffer) - 1;  // registry strings need not be terminated
+    DWORD type = 0;
+    const LSTATUS status = RegQueryValueExA(key, valueName, nullptr, &type,
+                                            reinterpret_cast<LPBYTE>(buffer), &size);
+    RegCloseKey(key);
+    if (status != ERROR_SUCCESS || (type != REG_SZ && type != REG_EXPAND_SZ)) {
+        return std::string();
+    }
+    std::string value(buffer);
+    if (!value.empty() && value.front() == '"' && value.back() == '"' && value.size() > 1) {
+        value = value.substr(1, value.size() - 2);
+    }
+    char expanded[1024] = {0};
+    const DWORD written =
+        ExpandEnvironmentStringsA(value.c_str(), expanded, static_cast<DWORD>(sizeof(expanded)));
+    return (written > 0 && written <= sizeof(expanded)) ? std::string(expanded) : value;
+}
+
+// Machine type from the PE header of [path]; 0 when the file cannot be read
+// (treated as "unknown", never as a reason to hide a driver).
+uint16_t peMachine(const std::string& path) {
+    HANDLE file = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                              nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return 0;
+    }
+    uint16_t machine = 0;
+    IMAGE_DOS_HEADER dos{};
+    DWORD read = 0;
+    if (ReadFile(file, &dos, sizeof(dos), &read, nullptr) && read == sizeof(dos) &&
+        dos.e_magic == IMAGE_DOS_SIGNATURE && dos.e_lfanew > 0 &&
+        SetFilePointer(file, dos.e_lfanew, nullptr, FILE_BEGIN) != INVALID_SET_FILE_POINTER) {
+        struct {
+            DWORD signature;
+            IMAGE_FILE_HEADER header;
+        } nt{};
+        if (ReadFile(file, &nt, sizeof(nt), &read, nullptr) && read == sizeof(nt) &&
+            nt.signature == IMAGE_NT_SIGNATURE) {
+            machine = nt.header.Machine;
+        }
+    }
+    CloseHandle(file);
+    return machine;
+}
+
+// HKLM\SOFTWARE\ASIO\<subkey>: CLSID (+ optional Description), appended to
+// [out] unless the CLSID is already there. [view] selects the 64- or 32-bit
+// registry view (see enumerateDrivers).
+void collectAsioKeys(REGSAM view, std::vector<DriverEntry>& out) {
     HKEY asioKey = nullptr;
-    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "SOFTWARE\\ASIO", 0, KEY_READ,
-                      &asioKey) != ERROR_SUCCESS) {
-        return drivers;
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "SOFTWARE\\ASIO", 0, KEY_READ | view, &asioKey) !=
+        ERROR_SUCCESS) {
+        return;
     }
     for (DWORD i = 0;; ++i) {
         char subName[256];
         DWORD subLen = sizeof(subName);
-        if (RegEnumKeyExA(asioKey, i, subName, &subLen, nullptr, nullptr,
-                          nullptr, nullptr) != ERROR_SUCCESS) {
+        if (RegEnumKeyExA(asioKey, i, subName, &subLen, nullptr, nullptr, nullptr, nullptr) !=
+            ERROR_SUCCESS) {
             break;
         }
-        HKEY driverKey = nullptr;
-        if (RegOpenKeyExA(asioKey, subName, 0, KEY_READ, &driverKey) != ERROR_SUCCESS) {
+        const std::string subKey = std::string("SOFTWARE\\ASIO\\") + subName;
+        const std::string clsid = readStringValue(subKey, "CLSID", view);
+        if (clsid.empty()) {
             continue;
         }
-        char clsid[256] = {0};
-        DWORD clsidLen = sizeof(clsid);
-        DWORD type = 0;
-        if (RegQueryValueExA(driverKey, "CLSID", nullptr, &type,
-                             reinterpret_cast<LPBYTE>(clsid), &clsidLen) == ERROR_SUCCESS &&
-            type == REG_SZ) {
-            char description[256] = {0};
-            DWORD descLen = sizeof(description);
-            if (RegQueryValueExA(driverKey, "Description", nullptr, &type,
-                                 reinterpret_cast<LPBYTE>(description),
-                                 &descLen) != ERROR_SUCCESS ||
-                type != REG_SZ || description[0] == '\0') {
-                std::snprintf(description, sizeof(description), "%s", subName);
-            }
-            drivers.push_back(DriverEntry{description, clsid});
+        const bool duplicate =
+            std::any_of(out.begin(), out.end(), [&clsid](const DriverEntry& entry) {
+                return _stricmp(entry.clsid.c_str(), clsid.c_str()) == 0;
+            });
+        if (duplicate) {
+            continue;
         }
-        RegCloseKey(driverKey);
+        std::string description = readStringValue(subKey, "Description", view);
+        if (description.empty()) {
+            description = subName;
+        }
+        out.push_back(DriverEntry{description, clsid});
     }
     RegCloseKey(asioKey);
-    return drivers;
+}
+
+// The installed ASIO drivers this process can actually load. Two things the
+// naive "enumerate HKLM\SOFTWARE\ASIO" does wrong and that made our list
+// differ from every other host's:
+//
+//  - Some installers register the driver ONLY in the 32-bit registry view
+//    (HKLM\SOFTWARE\WOW6432Node\ASIO) even when the DLL is 64-bit, so a
+//    64-bit host reading just the native view never sees it. We read both
+//    views and de-duplicate by CLSID.
+//  - Uninstalled drivers leave their ASIO key behind, and 32-bit-only drivers
+//    cannot be loaded in-proc by a 64-bit host at all. Both show up as
+//    entries that fail the moment they are picked, so they are dropped:
+//    an entry survives only if its COM server is registered and (for in-proc
+//    servers whose PE header is readable) built for this architecture.
+//
+// Order is the registry enumeration order; driver indices refer to this list.
+std::vector<DriverEntry> enumerateDrivers() {
+    std::vector<DriverEntry> found;
+    collectAsioKeys(KEY_WOW64_64KEY, found);
+    collectAsioKeys(KEY_WOW64_32KEY, found);
+
+    std::vector<DriverEntry> usable;
+    std::string report;
+    for (const DriverEntry& entry : found) {
+        const std::string clsidKey = "SOFTWARE\\Classes\\CLSID\\" + entry.clsid;
+        std::string path = readStringValue(clsidKey + "\\InprocServer32", "", KEY_WOW64_64KEY);
+        if (path.empty()) {
+            path = readStringValue(clsidKey + "\\InprocServer32", "", KEY_WOW64_32KEY);
+        }
+        const char* reason = nullptr;
+        uint16_t machine = 0;
+        if (path.empty()) {
+            // Out-of-process drivers are rare but legal; bitness is then the
+            // server's business, not ours.
+            const bool localServer =
+                !readStringValue(clsidKey + "\\LocalServer32", "", KEY_WOW64_64KEY).empty() ||
+                !readStringValue(clsidKey + "\\LocalServer32", "", KEY_WOW64_32KEY).empty();
+            if (!localServer) {
+                reason = "no COM server registered";
+            }
+        } else if (GetFileAttributesA(path.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            reason = "driver DLL missing";
+        } else {
+            machine = peMachine(path);
+            if (machine != 0 && machine != kHostMachine) {
+                reason = "wrong bitness";
+            }
+        }
+
+        char line[1024];
+        std::snprintf(line, sizeof(line), "NicheLooper: ASIO %-28s %s [machine=0x%04x] %s\n",
+                      entry.name.c_str(), reason == nullptr ? "OK     " : "SKIPPED",
+                      machine, reason == nullptr ? path.c_str() : reason);
+        report += line;
+        if (reason == nullptr) {
+            usable.push_back(entry);
+        }
+    }
+
+    // Enumeration runs on every device poll (~1.5 s); log only when the
+    // picture changed, so the terminal shows one block at startup and one
+    // per hot-plug/install.
+    static std::mutex reportLock;
+    static std::string lastReport;
+    std::lock_guard<std::mutex> guard(reportLock);
+    if (report != lastReport) {
+        lastReport = report;
+        std::fprintf(stderr, "NicheLooper: %zu ASIO driver(s) usable of %zu registered\n",
+                     usable.size(), found.size());
+        std::fputs(report.c_str(), stderr);
+    }
+    return usable;
 }
 
 // ---- Sample conversion (driver format <-> float, per channel) -------------

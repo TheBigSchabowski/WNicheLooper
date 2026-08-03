@@ -9,6 +9,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <cwchar>
 #include <functional>
 #include <mutex>
 #include <utility>
@@ -51,6 +52,18 @@ namespace {
 // messages. AWT threads are off limits, so all editor work runs on this one
 // internal thread via posted jobs. Leaked on purpose: it lives until process
 // exit, exactly like the editor-window map on macOS.
+//
+// This thread is also the ONLY thread that may create, initialise or destroy
+// a plugin (see runOnPluginThread). Plugin frameworks bind themselves to the
+// thread that constructs the first instance: JUCE (Neural DSP Archetypes and
+// most commercial plugins) records it as its "message thread" and routes
+// every editor creation, repaint and timer through that thread's message
+// queue. Instantiating on a Kotlin coroutine worker — which never pumps
+// messages and is recycled away after 60 s idle — leaves such a plugin with a
+// message thread that cannot deliver anything: audio keeps working (process()
+// needs no message loop) while the editor never appears, and a createView /
+// attached() that waits for the message manager wedges this thread, so every
+// later editor job in the FIFO dies with it.
 
 constexpr UINT kRunJobMessage = WM_APP + 1;
 
@@ -66,10 +79,17 @@ public:
         return *thread;
     }
 
-    // Runs [fn] on the UI thread. wait=true blocks until it finished — never
-    // call that variant FROM the UI thread (self-deadlock); jobs themselves
-    // always run there, so nested run(false, …) is fine.
+    // Runs [fn] on the UI thread. wait=true blocks until it finished; calling
+    // it FROM the UI thread runs [fn] inline instead of deadlocking, so nested
+    // run(…) is always safe.
     void run(bool wait, std::function<void()> fn) {
+        // ExitProcess terminates every other thread before the CRT runs static
+        // destructors, so at shutdown this thread may already be gone. Posting
+        // then would block forever — run the job inline instead.
+        if (mThread != nullptr && WaitForSingleObject(mThread, 0) == WAIT_OBJECT_0) {
+            fn();
+            return;
+        }
         WaitForSingleObject(mReady, INFINITE);
         if (GetCurrentThreadId() == mThreadId) {
             fn();
@@ -94,16 +114,15 @@ public:
 private:
     PluginUiThread() {
         mReady = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-        HANDLE thread = CreateThread(
+        // The handle is kept (never closed) so run() can tell a terminated
+        // thread from a busy one.
+        mThread = CreateThread(
             nullptr, 0,
             [](LPVOID param) -> DWORD {
                 static_cast<PluginUiThread*>(param)->threadMain();
                 return 0;
             },
             this, 0, nullptr);
-        if (thread != nullptr) {
-            CloseHandle(thread);
-        }
     }
 
     static LRESULT CALLBACK messageProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -138,6 +157,8 @@ private:
         RegisterClassW(&messageClass);
         mMessageWindow = CreateWindowExW(0, messageClass.lpszClassName, L"", 0, 0, 0, 0, 0,
                                          HWND_MESSAGE, nullptr, messageClass.hInstance, nullptr);
+        std::fprintf(stderr, "NicheLooper: plugin UI thread ready (tid=%lu)\n",
+                     static_cast<unsigned long>(mThreadId));
         SetEvent(mReady);
 
         MSG msg;
@@ -149,9 +170,16 @@ private:
     }
 
     HANDLE mReady = nullptr;
+    HANDLE mThread = nullptr;
     HWND mMessageWindow = nullptr;
     DWORD mThreadId = 0;
 };
+
+// Everything that creates, initialises or destroys a plugin must run here —
+// see the PluginUiThread comment for why. Blocks until [fn] finished.
+void runOnPluginThread(std::function<void()> fn) {
+    PluginUiThread::instance().run(true, std::move(fn));
+}
 
 // ---- Editor windows -------------------------------------------------------
 
@@ -237,6 +265,41 @@ void registerEditorClassOnce() {
     editorClass.lpszClassName = kEditorClassName;
     RegisterClassW(&editorClass);
     registered = true;
+}
+
+struct MainWindowSearch {
+    DWORD processId;
+    HWND result;
+};
+
+BOOL CALLBACK findMainWindowProc(HWND hwnd, LPARAM param) {
+    auto* search = reinterpret_cast<MainWindowSearch*>(param);
+    DWORD processId = 0;
+    GetWindowThreadProcessId(hwnd, &processId);
+    if (processId != search->processId || !IsWindowVisible(hwnd) ||
+        GetWindow(hwnd, GW_OWNER) != nullptr) {
+        return TRUE;
+    }
+    // Compose Desktop renders into a JFrame, whose Win32 class is SunAwtFrame.
+    wchar_t className[64] = {0};
+    GetClassNameW(hwnd, className, 64);
+    if (std::wcscmp(className, L"SunAwtFrame") != 0) {
+        return TRUE;
+    }
+    search->result = hwnd;
+    return FALSE;
+}
+
+// The app's own Compose/AWT main window, or null if it cannot be found.
+// Editor windows are created as OWNED windows of it: Windows keeps an owned
+// window above its owner permanently, which is what every plugin host does and
+// the only reliable cure for "the editor opened behind the main window" — a
+// one-shot raise loses the moment the JVM window takes focus back after the
+// click that opened the editor.
+HWND mainAppWindow() {
+    MainWindowSearch search{GetCurrentProcessId(), nullptr};
+    EnumWindows(&findMainWindowProc, reinterpret_cast<LPARAM>(&search));
+    return search.result;
 }
 
 
@@ -643,11 +706,14 @@ public:
             }
             RECT rect{0, 0, size.getWidth(), size.getHeight()};
             AdjustWindowRectEx(&rect, style, FALSE, 0);
+            const HWND owner = mainAppWindow();
             HWND hwnd = CreateWindowExW(
                 0, kEditorClassName, toWide(mName).c_str(), style, CW_USEDEFAULT, CW_USEDEFAULT,
-                rect.right - rect.left, rect.bottom - rect.top, nullptr, nullptr,
+                rect.right - rect.left, rect.bottom - rect.top, owner, nullptr,
                 GetModuleHandleW(nullptr), nullptr);
             if (hwnd == nullptr) {
+                std::fprintf(stderr, "NicheLooper: %s CreateWindowEx failed (%lu)\n",
+                             mName.c_str(), GetLastError());
                 view->release();
                 return;
             }
@@ -677,8 +743,9 @@ public:
             mEditor = editor;
             bringToForeground(hwnd);
             std::fprintf(stderr,
-                "NicheLooper: editor window open for %s (%dx%d, resizable=%d)\n",
-                mName.c_str(), size.getWidth(), size.getHeight(), resizable ? 1 : 0);
+                "NicheLooper: editor window open for %s (%dx%d, resizable=%d, owner=%p)\n",
+                mName.c_str(), size.getWidth(), size.getHeight(), resizable ? 1 : 0,
+                static_cast<void*>(owner));
         });
     }
 
@@ -891,6 +958,40 @@ std::unique_ptr<VstPlugin> buildFirstEffectFromPath(const std::string& path) {
     return nullptr;
 }
 
+// Loads, instantiates and prepares a plugin ON THE PLUGIN UI THREAD. [uid]
+// null means "the module's first audio-effect class" (add-from-file). Returns
+// null on any failure — a half-built plugin is torn down on that thread too.
+std::unique_ptr<VstPlugin> buildAndPrepare(const std::string& path, const VST3::UID* uid,
+                                           const std::string& displayName, int sampleRate,
+                                           int maxFrames) {
+    std::unique_ptr<VstPlugin> plugin;
+    runOnPluginThread([&] {
+        plugin = uid != nullptr ? buildPlugin(path, *uid, displayName)
+                                : buildFirstEffectFromPath(path);
+        if (plugin != nullptr && !plugin->prepare(sampleRate, maxFrames)) {
+            plugin.reset();
+        }
+    });
+    return plugin;
+}
+
+// Terminating and releasing a plugin has to happen on the thread that created
+// it (it is the plugin framework's message thread — the last instance going
+// away tears that framework down again).
+void destroyOnPluginThread(std::unique_ptr<VstPlugin> plugin) {
+    if (plugin == nullptr) {
+        return;
+    }
+    runOnPluginThread([&] { plugin.reset(); });
+}
+
+void destroyOnPluginThread(std::vector<std::unique_ptr<VstPlugin>> plugins) {
+    if (plugins.empty()) {
+        return;
+    }
+    runOnPluginThread([&] { plugins.clear(); });
+}
+
 // ---- Bank serialization helpers -------------------------------------------
 
 constexpr uint32_t kBankMagic = 0x314B574Eu;  // "NWK1" little-endian
@@ -962,10 +1063,20 @@ struct PluginChainManager::Impl {
 };
 
 PluginChainManager::PluginChainManager() : mImpl(std::make_unique<Impl>()) {}
-PluginChainManager::~PluginChainManager() = default;
+
+PluginChainManager::~PluginChainManager() {
+    for (auto& chain : mImpl->chains) {
+        destroyOnPluginThread(std::move(chain));
+    }
+}
 
 std::vector<std::string> PluginChainManager::availablePluginNames() {
-    auto scanned = scanInstalledPlugins();
+    // The scan loads every installed module once; doing that on the plugin UI
+    // thread keeps ALL plugin code on one STA, message-pumping thread (a
+    // plugin popping up a licence dialog during load then actually works
+    // instead of hanging a coroutine worker forever).
+    std::vector<AvailablePlugin> scanned;
+    runOnPluginThread([&] { scanned = scanInstalledPlugins(); });
     std::vector<std::string> names;
     names.reserve(scanned.size());
     for (const auto& plugin : scanned) {
@@ -995,8 +1106,8 @@ bool PluginChainManager::addPlugin(int chain, int pluginIndex) {
 
     // Instantiate + initialize OUTSIDE the lock (can take hundreds of ms for
     // big plugins) so the audio thread keeps processing meanwhile.
-    auto plugin = buildPlugin(spec.path, spec.uid, spec.displayName);
-    if (plugin == nullptr || !plugin->prepare(sampleRate, maxFrames)) {
+    auto plugin = buildAndPrepare(spec.path, &spec.uid, spec.displayName, sampleRate, maxFrames);
+    if (plugin == nullptr) {
         return false;
     }
 
@@ -1019,8 +1130,8 @@ bool PluginChainManager::addPluginFromPath(int chain, const std::string& path) {
 
     // Load + instantiate OUTSIDE the lock (can take hundreds of ms) so the audio
     // thread keeps processing meanwhile — identical to addPlugin().
-    auto plugin = buildFirstEffectFromPath(path);
-    if (plugin == nullptr || !plugin->prepare(sampleRate, maxFrames)) {
+    auto plugin = buildAndPrepare(path, nullptr, std::string(), sampleRate, maxFrames);
+    if (plugin == nullptr) {
         return false;
     }
 
@@ -1043,10 +1154,10 @@ bool PluginChainManager::removePlugin(int chain, int slot) {
         removed = std::move(plugins[static_cast<size_t>(slot)]);
         plugins.erase(plugins.begin() + slot);
     }
-    // Destroyed outside the lock: closes the editor window (sync on the UI
-    // thread) and terminates the plugin after the audio thread can no longer
-    // see it.
-    removed.reset();
+    // Destroyed outside the lock and on the plugin UI thread: closes the
+    // editor window and terminates the plugin after the audio thread can no
+    // longer see it.
+    destroyOnPluginThread(std::move(removed));
     return true;
 }
 
@@ -1105,11 +1216,13 @@ void PluginChainManager::prepare(int sampleRate, int maxFrames) {
     if (!changed) {
         return;
     }
-    for (auto& chain : mImpl->chains) {
-        for (auto& plugin : chain) {
-            plugin->prepare(sampleRate, maxFrames);
+    runOnPluginThread([&] {
+        for (auto& chain : mImpl->chains) {
+            for (auto& plugin : chain) {
+                plugin->prepare(sampleRate, maxFrames);
+            }
         }
-    }
+    });
 }
 
 void PluginChainManager::processBlock(float* mono, int frames) {
@@ -1158,20 +1271,24 @@ std::vector<uint8_t> PluginChainManager::saveBank() {
     putInt(out, static_cast<int32_t>(kBankMagic));
     putInt(out, 1);  // version
     putInt(out, mImpl->active.load(std::memory_order_relaxed));
-    for (int c = 0; c < kNumChains; ++c) {
-        putInt(out, static_cast<int32_t>(mImpl->chains[c].size()));
-        for (const auto& plugin : mImpl->chains[c]) {
-            std::vector<uint8_t> componentState;
-            std::vector<uint8_t> controllerState;
-            plugin->captureState(componentState, controllerState);
-            const std::string uid = plugin->uid().toString();
-            putBlob(out, plugin->name().data(), plugin->name().size());
-            putBlob(out, plugin->modulePath().data(), plugin->modulePath().size());
-            putBlob(out, uid.data(), uid.size());
-            putBlob(out, componentState.data(), componentState.size());
-            putBlob(out, controllerState.data(), controllerState.size());
+    // getState reaches into the plugin's controller (its GUI side), so it goes
+    // to the plugin UI thread like every other non-audio plugin call.
+    runOnPluginThread([&] {
+        for (int c = 0; c < kNumChains; ++c) {
+            putInt(out, static_cast<int32_t>(mImpl->chains[c].size()));
+            for (const auto& plugin : mImpl->chains[c]) {
+                std::vector<uint8_t> componentState;
+                std::vector<uint8_t> controllerState;
+                plugin->captureState(componentState, controllerState);
+                const std::string uid = plugin->uid().toString();
+                putBlob(out, plugin->name().data(), plugin->name().size());
+                putBlob(out, plugin->modulePath().data(), plugin->modulePath().size());
+                putBlob(out, uid.data(), uid.size());
+                putBlob(out, componentState.data(), componentState.size());
+                putBlob(out, controllerState.data(), controllerState.size());
+            }
         }
-    }
+    });
     return out;
 }
 
@@ -1226,27 +1343,31 @@ bool PluginChainManager::loadBank(const uint8_t* data, size_t size) {
         return false;
     }
 
-    // Instantiate everything OUTSIDE the lock, then swap the chains in.
+    // Instantiate everything OUTSIDE the lock, then swap the chains in. One
+    // job for the whole bank: build, prepare AND state restore belong on the
+    // plugin UI thread (setState reaches into the plugin's GUI side).
     std::array<std::vector<std::unique_ptr<VstPlugin>>, kNumChains> built;
-    for (int c = 0; c < kNumChains; ++c) {
-        for (const auto& spec : chainsSpec[c]) {
-            auto uid = VST3::UID::fromString(spec.uid);
-            if (!uid) {
-                std::fprintf(stderr, "NicheLooper: bad plugin id for %s\n", spec.name.c_str());
-                continue;
+    runOnPluginThread([&] {
+        for (int c = 0; c < kNumChains; ++c) {
+            for (const auto& spec : chainsSpec[c]) {
+                auto uid = VST3::UID::fromString(spec.uid);
+                if (!uid) {
+                    std::fprintf(stderr, "NicheLooper: bad plugin id for %s\n", spec.name.c_str());
+                    continue;
+                }
+                auto plugin = buildPlugin(spec.path, *uid, spec.name);
+                if (plugin == nullptr || !plugin->prepare(sampleRate, maxFrames)) {
+                    std::fprintf(stderr, "NicheLooper: preset plugin failed: %s\n",
+                                 spec.name.c_str());
+                    continue;
+                }
+                if (!spec.componentState.empty()) {
+                    plugin->restoreState(spec.componentState, spec.controllerState);
+                }
+                built[c].push_back(std::move(plugin));
             }
-            auto plugin = buildPlugin(spec.path, *uid, spec.name);
-            if (plugin == nullptr || !plugin->prepare(sampleRate, maxFrames)) {
-                std::fprintf(stderr, "NicheLooper: preset plugin failed: %s\n",
-                             spec.name.c_str());
-                continue;
-            }
-            if (!spec.componentState.empty()) {
-                plugin->restoreState(spec.componentState, spec.controllerState);
-            }
-            built[c].push_back(std::move(plugin));
         }
-    }
+    });
 
     std::array<std::vector<std::unique_ptr<VstPlugin>>, kNumChains> old;
     {
@@ -1260,7 +1381,8 @@ bool PluginChainManager::loadBank(const uint8_t* data, size_t size) {
         }
     }
     for (int c = 0; c < kNumChains; ++c) {
-        old[c].clear();  // editor windows + plugins torn down outside the lock
+        // Editor windows + plugins torn down outside the lock, on the UI thread.
+        destroyOnPluginThread(std::move(old[c]));
     }
     return true;
 }

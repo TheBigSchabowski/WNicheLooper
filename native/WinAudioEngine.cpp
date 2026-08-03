@@ -9,6 +9,20 @@ namespace {
 constexpr int32_t kPeriodFrames = 256;
 constexpr int32_t kMaxBlockFrames = 8192;
 constexpr int32_t kPreferredAsioRate = 48000;
+
+// refreshDevices() runs on a 1.5 s poll, so the enumeration is logged only
+// when it actually changed: one block at startup, one per hot-plug. This is
+// the ground truth for "which backend am I on and what does it see" — the
+// list in the UI is exactly this list.
+void logIfChanged(const std::string& text) {
+    static std::mutex lock;
+    static std::string last;
+    std::lock_guard<std::mutex> guard(lock);
+    if (text != last) {
+        last = text;
+        std::fputs(text.c_str(), stderr);
+    }
+}
 }  // namespace
 
 void WinAudioEngine::setBackendType(AudioBackendType type) {
@@ -45,6 +59,12 @@ bool WinAudioEngine::refreshDevices() {
         mOutputNames = drivers;
         mDefaultInput = drivers.empty() ? -1 : 0;
         mDefaultOutput = mDefaultInput;
+
+        std::string report = "NicheLooper: backend=ASIO, device list:\n";
+        for (const auto& name : drivers) {
+            report += "  " + name + "\n";
+        }
+        logIfChanged(report);
         return true;
     }
 
@@ -82,6 +102,17 @@ bool WinAudioEngine::refreshDevices() {
             mDefaultOutput = static_cast<int32_t>(i);
         }
     }
+
+    std::string report = "NicheLooper: backend=WASAPI, device list:\n";
+    for (size_t i = 0; i < mInputNames.size(); ++i) {
+        report += "  in  " + mInputNames[i] +
+                  (static_cast<int32_t>(i) == mDefaultInput ? "  (default)\n" : "\n");
+    }
+    for (size_t i = 0; i < mOutputNames.size(); ++i) {
+        report += "  out " + mOutputNames[i] +
+                  (static_cast<int32_t>(i) == mDefaultOutput ? "  (default)\n" : "\n");
+    }
+    logIfChanged(report);
     return true;
 }
 
