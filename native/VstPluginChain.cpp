@@ -239,6 +239,18 @@ LRESULT CALLBACK editorProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             // lives until the plugin is removed, exactly like on macOS.
             ShowWindow(hwnd, SW_HIDE);
             return 0;
+        case WM_SETFOCUS:
+            // Keyboard messages go to the FOCUSED window. This frame is only a
+            // container: without handing focus on, every key would land here
+            // and be dropped by DefWindowProc until the user has clicked into
+            // the editor (which makes most plugin GUI frameworks take focus
+            // themselves). Mouse input needs nothing of the sort — Windows
+            // posts it to the message queue of the thread that owns the window
+            // under the cursor, i.e. straight into this thread's loop.
+            if (HWND child = GetWindow(hwnd, GW_CHILD)) {
+                SetFocus(child);
+            }
+            return 0;
         case WM_SIZE:
             if (window != nullptr && window->view != nullptr) {
                 RECT client{};
