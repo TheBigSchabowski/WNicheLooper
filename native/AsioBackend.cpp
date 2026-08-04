@@ -31,21 +31,23 @@ constexpr uint16_t kHostMachine = 0x8664;  // IMAGE_FILE_MACHINE_AMD64
 constexpr uint16_t kHostMachine = 0x014C;  // IMAGE_FILE_MACHINE_I386
 #endif
 
-// Reads a REG_SZ/REG_EXPAND_SZ value ("" = the key's default value) from the
-// given registry view. Empty when absent or of another type.
-std::string readStringValue(const std::string& subKey, const char* valueName, REGSAM view) {
+// Reads a string value ("" = the key's default value) from the given root and
+// registry view. Empty when absent. The value TYPE is deliberately not checked:
+// the ASIO SDK's own driver list (host/pc/asiolist.cpp, the enumeration every
+// RtAudio-based host uses) ignores it too, and a driver whose installer wrote
+// e.g. REG_EXPAND_SZ must not vanish from our list alone.
+std::string readStringValue(HKEY root, const std::string& subKey, const char* valueName,
+                            REGSAM view) {
     HKEY key = nullptr;
-    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, subKey.c_str(), 0, KEY_READ | view, &key) !=
-        ERROR_SUCCESS) {
+    if (RegOpenKeyExA(root, subKey.c_str(), 0, KEY_READ | view, &key) != ERROR_SUCCESS) {
         return std::string();
     }
     char buffer[1024] = {0};
     DWORD size = sizeof(buffer) - 1;  // registry strings need not be terminated
-    DWORD type = 0;
-    const LSTATUS status = RegQueryValueExA(key, valueName, nullptr, &type,
+    const LSTATUS status = RegQueryValueExA(key, valueName, nullptr, nullptr,
                                             reinterpret_cast<LPBYTE>(buffer), &size);
     RegCloseKey(key);
-    if (status != ERROR_SUCCESS || (type != REG_SZ && type != REG_EXPAND_SZ)) {
+    if (status != ERROR_SUCCESS) {
         return std::string();
     }
     std::string value(buffer);
@@ -56,6 +58,22 @@ std::string readStringValue(const std::string& subKey, const char* valueName, RE
     const DWORD written =
         ExpandEnvironmentStringsA(value.c_str(), expanded, static_cast<DWORD>(sizeof(expanded)));
     return (written > 0 && written <= sizeof(expanded)) ? std::string(expanded) : value;
+}
+
+// Resolves a driver DLL path the way the ASIO SDK's OpenFile(OF_EXIST) does:
+// as given, else searched in the Windows/System directories and along PATH
+// (some installers register a bare file name). Empty when it does not exist.
+std::string resolveDriverDll(const std::string& path) {
+    if (path.empty()) {
+        return std::string();
+    }
+    if (GetFileAttributesA(path.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        return path;
+    }
+    char found[MAX_PATH] = {0};
+    const DWORD length = SearchPathA(nullptr, path.c_str(), nullptr,
+                                     static_cast<DWORD>(sizeof(found)), found, nullptr);
+    return (length > 0 && length < sizeof(found)) ? std::string(found) : std::string();
 }
 
 // Machine type from the PE header of [path]; 0 when the file cannot be read
@@ -102,7 +120,7 @@ void collectAsioKeys(REGSAM view, std::vector<DriverEntry>& out) {
             break;
         }
         const std::string subKey = std::string("SOFTWARE\\ASIO\\") + subName;
-        const std::string clsid = readStringValue(subKey, "CLSID", view);
+        const std::string clsid = readStringValue(HKEY_LOCAL_MACHINE, subKey, "CLSID", view);
         if (clsid.empty()) {
             continue;
         }
@@ -113,7 +131,7 @@ void collectAsioKeys(REGSAM view, std::vector<DriverEntry>& out) {
         if (duplicate) {
             continue;
         }
-        std::string description = readStringValue(subKey, "Description", view);
+        std::string description = readStringValue(HKEY_LOCAL_MACHINE, subKey, "Description", view);
         if (description.empty()) {
             description = subName;
         }
@@ -122,19 +140,25 @@ void collectAsioKeys(REGSAM view, std::vector<DriverEntry>& out) {
     RegCloseKey(asioKey);
 }
 
-// The installed ASIO drivers this process can actually load. Two things the
-// naive "enumerate HKLM\SOFTWARE\ASIO" does wrong and that made our list
-// differ from every other host's:
+// The installed ASIO drivers this process can actually load.
 //
-//  - Some installers register the driver ONLY in the 32-bit registry view
-//    (HKLM\SOFTWARE\WOW6432Node\ASIO) even when the DLL is 64-bit, so a
-//    64-bit host reading just the native view never sees it. We read both
-//    views and de-duplicate by CLSID.
-//  - Uninstalled drivers leave their ASIO key behind, and 32-bit-only drivers
-//    cannot be loaded in-proc by a 64-bit host at all. Both show up as
-//    entries that fail the moment they are picked, so they are dropped:
-//    an entry survives only if its COM server is registered and (for in-proc
-//    servers whose PE header is readable) built for this architecture.
+// Reference behaviour is the ASIO SDK's own list (third_party/asiosdk/host/pc/
+// asiolist.cpp) — the enumeration every RtAudio-based host uses, including the
+// NAM standalone the user compares against: enumerate HKLM\SOFTWARE\ASIO, read
+// each key's CLSID and Description, resolve the CLSID against HKEY_CLASSES_ROOT
+// \CLSID\…\InprocServer32 and check the DLL exists. We follow it, plus:
+//
+//  - Both registry views are read and de-duplicated by CLSID. Some installers
+//    register the driver ONLY under WOW6432Node\ASIO even when the DLL is
+//    64-bit, so a 64-bit host reading just the native view never sees it.
+//  - Dead entries are dropped. The SDK's existence check is effectively a
+//    no-op (it tests OpenFile's return against 0, but failure is -1), so its
+//    list still contains leftovers of uninstalled drivers; RtAudio hides those
+//    later by actually loading and ASIOInit-ing every driver while probing.
+//    We get the same result without touching the hardware: an entry survives
+//    only with a registered COM server whose DLL exists and — when the PE
+//    header is readable — matches this process's architecture. A 32-bit driver
+//    can never be CoCreateInstance'd in-proc from a 64-bit host.
 //
 // Order is the registry enumeration order; driver indices refer to this list.
 std::vector<DriverEntry> enumerateDrivers() {
@@ -145,23 +169,32 @@ std::vector<DriverEntry> enumerateDrivers() {
     std::vector<DriverEntry> usable;
     std::string report;
     for (const DriverEntry& entry : found) {
-        const std::string clsidKey = "SOFTWARE\\Classes\\CLSID\\" + entry.clsid;
-        std::string path = readStringValue(clsidKey + "\\InprocServer32", "", KEY_WOW64_64KEY);
-        if (path.empty()) {
-            path = readStringValue(clsidKey + "\\InprocServer32", "", KEY_WOW64_32KEY);
+        // Via HKEY_CLASSES_ROOT like the SDK, NOT via HKLM\Software\Classes:
+        // HKCR merges the per-machine and the per-USER registrations, and
+        // installers that run without admin rights register the driver's COM
+        // server under HKCU only.
+        const std::string clsidKey = "CLSID\\" + entry.clsid;
+        std::string raw = readStringValue(HKEY_CLASSES_ROOT, clsidKey + "\\InprocServer32", "",
+                                          KEY_WOW64_64KEY);
+        if (raw.empty()) {
+            raw = readStringValue(HKEY_CLASSES_ROOT, clsidKey + "\\InprocServer32", "",
+                                  KEY_WOW64_32KEY);
         }
+        std::string path = resolveDriverDll(raw);
         const char* reason = nullptr;
         uint16_t machine = 0;
-        if (path.empty()) {
+        if (raw.empty()) {
             // Out-of-process drivers are rare but legal; bitness is then the
             // server's business, not ours.
             const bool localServer =
-                !readStringValue(clsidKey + "\\LocalServer32", "", KEY_WOW64_64KEY).empty() ||
-                !readStringValue(clsidKey + "\\LocalServer32", "", KEY_WOW64_32KEY).empty();
+                !readStringValue(HKEY_CLASSES_ROOT, clsidKey + "\\LocalServer32", "",
+                                 KEY_WOW64_64KEY).empty() ||
+                !readStringValue(HKEY_CLASSES_ROOT, clsidKey + "\\LocalServer32", "",
+                                 KEY_WOW64_32KEY).empty();
             if (!localServer) {
                 reason = "no COM server registered";
             }
-        } else if (GetFileAttributesA(path.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        } else if (path.empty()) {
             reason = "driver DLL missing";
         } else {
             machine = peMachine(path);
@@ -171,9 +204,10 @@ std::vector<DriverEntry> enumerateDrivers() {
         }
 
         char line[1024];
-        std::snprintf(line, sizeof(line), "NicheLooper: ASIO %-28s %s [machine=0x%04x] %s\n",
-                      entry.name.c_str(), reason == nullptr ? "OK     " : "SKIPPED",
-                      machine, reason == nullptr ? path.c_str() : reason);
+        std::snprintf(line, sizeof(line), "NicheLooper: ASIO %-28s %-7s [machine=0x%04x] %s%s%s\n",
+                      entry.name.c_str(), reason == nullptr ? "OK" : "SKIPPED", machine,
+                      reason == nullptr ? "" : reason, reason == nullptr ? "" : " -> ",
+                      raw.empty() ? "(no server path)" : raw.c_str());
         report += line;
         if (reason == nullptr) {
             usable.push_back(entry);
